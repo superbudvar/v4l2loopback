@@ -171,6 +171,12 @@ typedef unsigned __poll_t;
 #define MAX_TIMEOUT (100 * 1000) /* in msecs */
 #endif
 
+static int force_capture_mode = 0;
+module_param(force_capture_mode, int, 0644);
+MODULE_PARM_DESC(force_capture_mode,
+	 "If set, querycap always advertises CAPTURE capability regardless of stream_tokens "
+	 "state. Useful when Chrome needs to see the device before any writer has streamed.");
+
 /* max buffers that can be mapped, actually they
  * are all mapped to max_buffers buffers */
 #ifndef MAX_BUFFERS
@@ -912,6 +918,11 @@ static int vidioc_querycap(struct file *file, void *fh,
 
 	if (dev->announce_all_caps) {
 		capabilities |= V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_VIDEO_OUTPUT;
+	} else if (force_capture_mode) {
+		/* force_capture_mode: always advertise CAPTURE so Chrome can see the
+		 * device before any writer has streamed. The writer can still open
+		 * and stream normally. */
+		capabilities |= V4L2_CAP_VIDEO_CAPTURE;
 	} else {
 		if (opener->io_method == V4L2L_IO_TIMEOUT ||
 		    (has_output_token(dev->stream_tokens) &&
@@ -2419,6 +2430,10 @@ static int v4l2_loopback_close(struct file *file)
 	v4l2_fh_del(&opener->fh, file);
 	v4l2_fh_exit(&opener->fh);
 
+	/* Release stream token if held (fixes #675) */
+	if (opener->stream_token)
+		release_token(dev, opener, stream);
+
 	kfree(opener);
 	return 0;
 }
@@ -2952,7 +2967,7 @@ static int v4l2_loopback_add(struct v4l2_loopback_config *conf, int *ret_nr)
 	spin_lock_init(&dev->list_lock);
 	init_waitqueue_head(&dev->read_event);
 	dev->format_tokens = V4L2L_TOKEN_MASK;
-	dev->stream_tokens = V4L2L_TOKEN_MASK;
+	dev->stream_tokens = 0; /* FIX: 0 not V4L2L_TOKEN_MASK — fixes #619/#675 */
 
 	/* initialise sustain frame rate and timeout parameters, and timers */
 	dev->reread_count = 0;
