@@ -33,7 +33,11 @@ struct v4l2_loopback_config {
          *
          */
 	__s32 output_nr;
-	__s32 unused; /*capture_nr;*/
+	__s32 capture_nr;  /* set for SPLIT_DEVICES; set to output_nr for normal */
+
+	/* Internal kernel-only fields (not part of UAPI ioctl ABI) */
+	__s32 is_capture_side;       /* non-zero = this is the CAPTURE-side device */
+	__u64 split_peer_addr;       /* pointer to peer v4l2_loopback_device (as integer) */
 
 	/**
          * a nice name for your device

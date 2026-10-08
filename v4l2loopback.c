@@ -177,6 +177,30 @@ MODULE_PARM_DESC(force_capture_mode,
 	 "If set, querycap always advertises CAPTURE capability regardless of stream_tokens "
 	 "state. Useful when Chrome needs to see the device before any writer has streamed.");
 
+/* split_mode: if set, each logical loopback "device" is represented by a pair of
+ * kernel devices: an OUTPUT-only node (for the writer, e.g. pyvirtualcam) and a
+ * CAPTURE-only node (for the reader, e.g. Chrome).  The two share the same
+ * frame buffer so frames written to OUTPUT are immediately readable from CAPTURE.
+ *
+ * With split_mode=1 and devices=N:
+ *   - 2*N actual video devices are created
+ *   - video_nr[2*i]   = OUTPUT node number for logical device i
+ *   - video_nr[2*i+1] = CAPTURE node number for logical device i
+ *   - exclusive_caps[2*i]   is used for the OUTPUT node
+ *   - exclusive_caps[2*i+1] is used for the CAPTURE node
+ *
+ * Example: split_mode=1 devices=2 video_nr=5,6,7,8
+ *   video5 = OUTPUT of pair 0  (pyvirtualcam writes here)
+ *   video6 = CAPTURE of pair 0 (Chrome reads from here)
+ *   video7 = OUTPUT of pair 1
+ *   video8 = CAPTURE of pair 1
+ */
+static int split_mode = 0;
+module_param(split_mode, int, 0444);
+MODULE_PARM_DESC(split_mode,
+	 "If set, create separate OUTPUT and CAPTURE device nodes per logical "
+	 "loopback device. Use video_nr pairs to specify the node numbers.");
+
 /* max buffers that can be mapped, actually they
  * are all mapped to max_buffers buffers */
 #ifndef MAX_BUFFERS
@@ -347,6 +371,14 @@ struct v4l2_loopback_device {
 	bool announce_all_caps; /* announce both OUTPUT and CAPTURE capabilities
 				 * when true; else announce OUTPUT when no
 				 * writer is streaming, otherwise CAPTURE. */
+
+	/* SPLIT_DEVICES: pointer to the peer device that shares our frame buffer.
+	 * The OUTPUT side allocates the image; the CAPTURE side sets this to
+	 * point at the OUTPUT side so it can read from the shared buffer. */
+	struct v4l2_loopback_device *split_peer;
+	/* True for the CAPTURE-side node, false for the OUTPUT-side node. */
+	bool split_is_capture;
+
 	int max_openers; /* how many times can this device be opened */
 	int min_width, max_width;
 	int min_height, max_height;
@@ -916,7 +948,13 @@ static int vidioc_querycap(struct file *file, void *fh,
 	snprintf(cap->bus_info, sizeof(cap->bus_info),
 		 "platform:v4l2loopback-%03d", device_nr);
 
-	if (dev->announce_all_caps) {
+	/* SPLIT_DEVICES: fixed capability — no need to check stream_tokens */
+	if (dev->split_peer) {
+		if (dev->split_is_capture)
+			capabilities |= V4L2_CAP_VIDEO_CAPTURE;
+		else
+			capabilities |= V4L2_CAP_VIDEO_OUTPUT;
+	} else if (dev->announce_all_caps) {
 		capabilities |= V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_VIDEO_OUTPUT;
 	} else if (force_capture_mode) {
 		/* force_capture_mode: always advertise CAPTURE so Chrome can see the
@@ -1889,7 +1927,24 @@ static int vidioc_qbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 	case V4L2_BUF_TYPE_VIDEO_CAPTURE:
 		dprintkrw("QBUF(CAPTURE, index=%u) -> " BUFFER_DEBUG_FMT_STR,
 			  index, BUFFER_DEBUG_FMT_ARGS(buf));
-		set_queued(buf->flags);
+		/* SPLIT_DEVICES: CAPTURE buffers share the OUTPUT's image memory.
+		 * Adding this buffer to the OUTPUT's outbufs_list signals that
+		 * Chrome has finished with this frame.  The OUTPUT writer sees it
+		 * as a newly-filled buffer and can overwrite it with the next
+		 * frame.  We use CAPTURE's buffer metadata (the mmap offset
+		 * Chrome wrote to) so Chrome continues to mmap the correct
+		 * shared memory region on subsequent DQBUF calls. */
+		if (dev->split_peer && dev->split_is_capture) {
+			struct v4l2_loopback_device *out = dev->split_peer;
+			bufd->buffer.sequence = out->write_position;
+			set_done(bufd->buffer.flags);
+			get_buffer(bufd);
+			list_add_tail(&bufd->list_head, &out->outbufs_list);
+			/* wake up any CAPTURE reader waiting for a frame */
+			wake_up_all(&dev->read_event);
+		} else {
+			set_queued(buf->flags);
+		}
 		break;
 	case V4L2_BUF_TYPE_VIDEO_OUTPUT:
 		dprintkrw("QBUF(OUTPUT, index=%u) -> " BUFFER_DEBUG_FMT_STR,
@@ -2794,7 +2849,14 @@ static int v4l2_loopback_add(struct v4l2_loopback_config *conf, int *ret_nr)
 	struct v4l2_loopback_device *dev;
 	struct v4l2_ctrl_handler *hdl;
 	struct v4l2loopback_private *vdev_priv = NULL;
+	struct video_device *vdev;
 	int err;
+
+	printk(KERN_INFO "v4l2loopback: v4l2_loopback_add called: is_capture_side=%d split_peer_addr=%lx output_nr=%d capture_nr=%d\n",
+	       conf ? conf->is_capture_side : -1,
+	       conf ? conf->split_peer_addr : 0UL,
+	       conf ? conf->output_nr : -1,
+	       conf ? conf->capture_nr : -1);
 
 	u32 _width = V4L2LOOPBACK_SIZE_DEFAULT_WIDTH;
 	u32 _height = V4L2LOOPBACK_SIZE_DEFAULT_HEIGHT;
@@ -2828,7 +2890,55 @@ static int v4l2_loopback_add(struct v4l2_loopback_config *conf, int *ret_nr)
 #else
 		const int capture_nr = output_nr;
 #endif
-		if (capture_nr >= 0 && output_nr == capture_nr) {
+		/* SPLIT_DEVICES split_mode layout:
+		 *
+		 * split_mode=1, devices=N, video_nr=vo,vc,vo,vc,...
+		 * For each logical device i:
+		 *   PASS 1: is_capture_side=0, output_nr=vo[i]
+		 *            -> creates OUTPUT dev at vo[i]
+		 *   PASS 2: is_capture_side=1, output_nr=vc[i], capture_nr=vc[i]
+		 *            -> creates CAPTURE dev at vc[i], linked to PASS 1 dev
+		 *
+		 * The return value is the OUTPUT device number;
+		 * the CAPTURE device number is stored in ret_nr[1].
+		 */
+		if (conf && conf->is_capture_side && conf->split_peer_addr) {
+			/* ── CAPTURE side: allocate independent dev, link to OUTPUT ── */
+			struct v4l2_loopback_device *peer;
+			peer = (struct v4l2_loopback_device *)(unsigned long)
+			       conf->split_peer_addr;
+			printk(KERN_INFO "v4l2loopback: CAPTURE side: peer=%px split_peer_addr=%lx\n",
+			       peer, conf->split_peer_addr);
+			if (!peer) {
+				printk(KERN_ERR "v4l2loopback: CAPTURE side: peer is NULL!\n");
+				return -EINVAL;
+			}
+
+			dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+			if (!dev)
+				return -ENOMEM;
+			idr_alloc(&v4l2loopback_index_idr, dev, 0, 0, GFP_KERNEL);
+
+			/* Inherit pixel format from OUTPUT peer */
+			dev->pix_format = peer->pix_format;
+			dev->pix_format_has_valid_sizeimage =
+				peer->pix_format_has_valid_sizeimage;
+
+			/* Share the OUTPUT side's image buffer.
+			 * peer->image is a (void**) pointing to the pixel buffer.
+			 * We set dev->image to the same (void**) pointer so that
+			 * reads via dev->image see the OUTPUT's pixel buffer. */
+			dev->image = peer->image;
+			dev->image_size = peer->image_size;
+
+			/* Bidirectional peer link */
+			dev->split_peer = peer;
+			peer->split_peer = dev;
+			dev->split_is_capture = true;
+
+			nr = capture_nr;
+			goto cap_register_vdev;
+		} else if (capture_nr >= 0 && output_nr == capture_nr) {
 			nr = output_nr;
 		} else if (capture_nr < 0 && output_nr < 0) {
 			nr = -1;
@@ -2837,14 +2947,10 @@ static int v4l2_loopback_add(struct v4l2_loopback_config *conf, int *ret_nr)
 		} else if (output_nr < 0) {
 			nr = capture_nr;
 		} else {
-			printk(KERN_ERR
-			       "v4l2-loopback add() split OUTPUT and CAPTURE "
-			       "devices not yet supported.\n");
-			printk(KERN_INFO
-			       "v4l2-loopback add() both devices must have the "
-			       "same number (%d != %d).\n",
-			       output_nr, capture_nr);
-			return -EINVAL;
+			/* SPLIT_DEVICES OUTPUT side: different device numbers */
+			nr = output_nr;
+			if (ret_nr)
+				ret_nr[1] = capture_nr;
 		}
 	}
 
@@ -3000,6 +3106,70 @@ static int v4l2_loopback_add(struct v4l2_loopback_config *conf, int *ret_nr)
 	err = v4l2_ctrl_handler_setup(hdl);
 	if (err)
 		goto out_free_handler;
+
+	/* ── CAPTURE-side vdev registration (jumped to from is_capture_side path) ──
+	 * dev is a freshly allocated CAPTURE struct that shares the image buffer
+	 * with the OUTPUT peer via dev->image==peer->image.
+	 * We need our own ctrl_handler and vdev registered at the CAPTURE nr.
+	 * We use a do/while(0) block so peer_dev is scoped but vdev/vdev_priv
+	 * remain function-scoped and the existing cleanup labels work correctly. */
+cap_register_vdev:
+		do {
+			struct v4l2_loopback_device *peer_dev = dev->split_peer;
+
+			hdl = &dev->ctrl_handler;
+			err = v4l2_ctrl_handler_init(hdl, 4);
+			if (err)
+				break;
+			v4l2_ctrl_new_custom(hdl, &v4l2loopback_ctrl_keepformat, NULL);
+			v4l2_ctrl_new_custom(hdl, &v4l2loopback_ctrl_sustainframerate, NULL);
+			v4l2_ctrl_new_custom(hdl, &v4l2loopback_ctrl_timeout, NULL);
+			v4l2_ctrl_new_custom(hdl, &v4l2loopback_ctrl_timeoutimageio, NULL);
+			if (hdl->error) {
+				err = hdl->error;
+				break;
+			}
+			dev->v4l2_dev.ctrl_handler = hdl;
+			err = v4l2_ctrl_handler_setup(hdl);
+			if (err)
+				break;
+
+			/* Allocate our own vdev for the CAPTURE side */
+			vdev = video_device_alloc();
+			if (!vdev) {
+				err = -ENOMEM;
+				break;
+			}
+			vdev_priv = kzalloc(sizeof(struct v4l2loopback_private), GFP_KERNEL);
+			if (!vdev_priv) {
+				video_device_release(vdev);
+				vdev = NULL;
+				err = -ENOMEM;
+				break;
+			}
+			video_set_drvdata(vdev, vdev_priv);
+			vdev_priv->device_nr = nr;
+			snprintf(vdev->name, sizeof(vdev->name), "%s (CAP)",
+				 peer_dev->card_label[0] ? peer_dev->card_label
+							  : "v4l2loopback");
+			snprintf(dev->card_label, sizeof(dev->card_label), "%s", vdev->name);
+			init_vdev(vdev, nr);
+			vdev->v4l2_dev = &dev->v4l2_dev;
+			dev->vdev = vdev;
+
+			if (video_register_device(vdev, VFL_TYPE_VIDEO, nr) < 0) {
+				err = -EFAULT;
+				break;
+			}
+			v4l2loopback_create_sysfs(vdev);
+			if (ret_nr)
+				*ret_nr = dev->vdev->num;
+			return 0;
+		} while (0);
+		/* On error: fall through to existing cleanup labels.
+		 * vdev/vdev_priv may be non-NULL if partially allocated;
+		 * the cleanup code will handle that. */
+		goto out_free_device;
 
 	/* register the device (creates /dev/video*) */
 	MARK();
@@ -3326,30 +3496,80 @@ static int __init v4l2loopback_init_module(void)
 	}
 
 	for (i = 0; i < devices; i++) {
-		struct v4l2_loopback_config cfg = {
-			// clang-format off
-			.output_nr		= video_nr[i],
-#ifdef SPLIT_DEVICES
-			.capture_nr		= video_nr[i],
-#endif
+		struct v4l2_loopback_config cfg_out = {
+			/* clang-format off */
+			.output_nr		= video_nr[split_mode ? (2 * i) : i],
 			.min_width		= min_width,
 			.min_height		= min_height,
 			.max_width		= max_width,
 			.max_height		= max_height,
-			.announce_all_caps	= (!exclusive_caps[i]),
+			.announce_all_caps	= 0,
 			.max_buffers		= max_buffers,
 			.max_openers		= max_openers,
 			.debug			= debug,
-			// clang-format on
+			/* clang-format on */
+			.is_capture_side	= 0,
+			.split_peer_addr	= 0,
 		};
-		cfg.card_label[0] = 0;
+		struct v4l2_loopback_config cfg_cap = {
+			/* clang-format off */
+			/* clang-format on */
+			.is_capture_side	= 0,
+			.split_peer_addr	= 0,
+		};
+		struct v4l2_loopback_device *out_dev = NULL;
+
+		cfg_out.card_label[0] = 0;
 		if (card_label[i])
-			snprintf(cfg.card_label, sizeof(cfg.card_label), "%s",
-				 card_label[i]);
-		err = v4l2_loopback_add(&cfg, 0);
+			snprintf(cfg_out.card_label, sizeof(cfg_out.card_label),
+				 "%s", card_label[i]);
+
+		/* PASS 1: create the OUTPUT device */
+		err = v4l2_loopback_add(&cfg_out, 0);
 		if (err) {
 			free_devices();
 			goto error;
+		}
+		{
+			int _err = v4l2loopback_lookup(video_nr[split_mode ? (2 * i) : i], &out_dev);
+			if (_err < 0)
+				out_dev = NULL;
+		}
+		if (!out_dev) {
+			free_devices();
+			err = -ENODEV;
+			goto error;
+		}
+
+		/* SPLIT_DEVICES: create the CAPTURE device as a peer */
+		if (split_mode) {
+			cfg_cap.output_nr = video_nr[2 * i + 1];
+			cfg_cap.capture_nr = video_nr[2 * i + 1];
+			cfg_cap.min_width  = min_width;
+			cfg_cap.min_height = min_height;
+			cfg_cap.max_width  = max_width;
+			cfg_cap.max_height = max_height;
+			cfg_cap.announce_all_caps = 0;
+			cfg_cap.max_buffers  = max_buffers;
+			cfg_cap.max_openers  = max_openers;
+			cfg_cap.debug	    = debug;
+			cfg_cap.is_capture_side = 1;
+			cfg_cap.split_peer_addr  = (unsigned long)out_dev;
+			cfg_cap.card_label[0] = 0;
+			if (card_label[i]) {
+				char cap_label[32];
+				snprintf(cap_label, sizeof(cap_label), "%s (CAP)",
+					 card_label[i]);
+				snprintf(cfg_cap.card_label, sizeof(cfg_cap.card_label),
+					 "%s", cap_label);
+			}
+			err = v4l2_loopback_add(&cfg_cap, 0);
+			if (err) {
+				free_devices();
+				goto error;
+			}
+			dprintk("SPLIT_DEVICES: pair %d: OUTPUT=video%d, CAPTURE=video%d\n",
+				i, video_nr[2 * i], video_nr[2 * i + 1]);
 		}
 	}
 
