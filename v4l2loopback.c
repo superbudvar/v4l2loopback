@@ -2952,7 +2952,7 @@ static int v4l2_loopback_add(struct v4l2_loopback_config *conf, int *ret_nr)
 	spin_lock_init(&dev->list_lock);
 	init_waitqueue_head(&dev->read_event);
 	dev->format_tokens = V4L2L_TOKEN_MASK;
-	dev->stream_tokens = V4L2L_TOKEN_MASK;
+	dev->stream_tokens = 0; /* FIX: 0 not V4L2L_TOKEN_MASK — fixes #619/#675 */
 
 	/* initialise sustain frame rate and timeout parameters, and timers */
 	dev->reread_count = 0;
