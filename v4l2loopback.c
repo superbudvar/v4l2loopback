@@ -2419,6 +2419,10 @@ static int v4l2_loopback_close(struct file *file)
 	v4l2_fh_del(&opener->fh, file);
 	v4l2_fh_exit(&opener->fh);
 
+	/* Release stream token if held (fixes #675) */
+	if (opener->stream_token)
+		release_token(dev, opener, stream);
+
 	kfree(opener);
 	return 0;
 }
